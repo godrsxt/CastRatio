@@ -4,7 +4,6 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Color as AndroidColor
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.projection.MediaProjection
@@ -17,6 +16,7 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.collectAsState
@@ -39,15 +39,28 @@ class ScreenCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundNotification()
+        try {
+            startForegroundNotification()
 
-        val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
-        val data: Intent? = intent?.getParcelableExtra("DATA")
+            val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+            
+            // Fix for Android 13+ Intent Parsing
+            val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent?.getParcelableExtra("DATA", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent?.getParcelableExtra("DATA")
+            }
 
-        if (resultCode == Activity.RESULT_OK && data != null) {
-            val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, data)
-            setupSecondaryDisplayScanner()
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+                setupSecondaryDisplayScanner()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Service Error: ${e.message}", Toast.LENGTH_LONG).show()
+            stopSelf() // Stop service if it fails to initialize
         }
 
         return START_NOT_STICKY
@@ -95,7 +108,6 @@ class ScreenCaptureService : Service() {
             val display = displays[0]
             if (currentPresentation?.display?.displayId != display.displayId) {
                 currentPresentation?.dismiss()
-                // Use a display-specific context for the Presentation
                 val displayContext = createDisplayContext(display)
                 currentPresentation = MirrorPresentation(displayContext, display) { surface, w, h ->
                     tvSurface = surface
@@ -109,14 +121,18 @@ class ScreenCaptureService : Service() {
 
     private fun startVirtualDisplay() {
         stopVirtualDisplay()
-        if (tvSurface != null && surfaceWidth > 0 && surfaceHeight > 0) {
-            val metrics = resources.displayMetrics
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "MirrorDisplay",
-                surfaceWidth, surfaceHeight, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                tvSurface, null, null
-            )
+        if (tvSurface != null && surfaceWidth > 0 && surfaceHeight > 0 && mediaProjection != null) {
+            try {
+                val metrics = resources.displayMetrics
+                virtualDisplay = mediaProjection?.createVirtualDisplay(
+                    "MirrorDisplay",
+                    surfaceWidth, surfaceHeight, metrics.densityDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    tvSurface, null, null
+                )
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 
@@ -133,7 +149,6 @@ class ScreenCaptureService : Service() {
     }
 }
 
-// Draws the SurfaceView on the TV
 class MirrorPresentation(
     context: Context,
     display: Display,
