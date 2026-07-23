@@ -96,14 +96,13 @@ class ScreenCaptureService : Service() {
                 currentPresentation?.dismiss()
                 
                 try {
-                    // FIX: Create a strict WindowContext so the Service is legally allowed to draw UI
                     val displayContext = applicationContext.createDisplayContext(display)
+                    // FIX: Using the public OVERLAY constant instead of the hidden PRESENTATION constant
                     val windowContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         displayContext.createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
                     } else {
                         displayContext
                     }
-
 
                     currentPresentation = MirrorPresentation(windowContext, display) { surface, w, h ->
                         tvSurface = surface
@@ -155,7 +154,9 @@ class MirrorPresentation(
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private lateinit var aspectRatioLayout: AspectRatioFrameLayout
 
-    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
         val rootLayout = FrameLayout(context).apply { setBackgroundColor(Color.BLACK) }
 
         aspectRatioLayout = AspectRatioFrameLayout(context).apply {
