@@ -6,7 +6,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     
-    <!-- New Permissions for Screen Capture & Foreground Service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -30,7 +29,7 @@
             </intent-filter>
         </activity>
 
-        <!-- Register the Foreground Service -->
+        <!-- The foregroundServiceType must be declared exactly like this -->
         <service
             android:name=".ScreenCaptureService"
             android:foregroundServiceType="mediaProjection"
