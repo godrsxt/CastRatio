@@ -94,12 +94,27 @@ class ScreenCaptureService : Service() {
             val display = displays[0]
             if (currentPresentation?.display?.displayId != display.displayId) {
                 currentPresentation?.dismiss()
-                currentPresentation = MirrorPresentation(createDisplayContext(display), display) { surface, w, h ->
-                    tvSurface = surface
-                    surfaceWidth = w
-                    surfaceHeight = h
-                    startVirtualDisplay()
-                }.apply { show() }
+                
+                try {
+                    // FIX: Create a strict WindowContext so the Service is legally allowed to draw UI
+                    val displayContext = applicationContext.createDisplayContext(display)
+                    val windowContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        displayContext.createWindowContext(WindowManager.LayoutParams.TYPE_PRESENTATION, null)
+                    } else {
+                        displayContext
+                    }
+
+                    currentPresentation = MirrorPresentation(windowContext, display) { surface, w, h ->
+                        tvSurface = surface
+                        surfaceWidth = w
+                        surfaceHeight = h
+                        startVirtualDisplay()
+                    }.apply { show() }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    Toast.makeText(applicationContext, "TV Render Error: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -130,7 +145,6 @@ class ScreenCaptureService : Service() {
     }
 }
 
-// Pure Android View Presentation (No Compose) to prevent API 35 crashes
 class MirrorPresentation(
     context: Context,
     display: Display,
@@ -143,12 +157,11 @@ class MirrorPresentation(
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // 1. Black background filling the entire TV
-        val rootLayout = FrameLayout(context).apply {
-            setBackgroundColor(Color.BLACK)
-        }
+        // FIX: Explicitly tell Android this is a Presentation window, bypassing strict token checks
+        window?.setType(WindowManager.LayoutParams.TYPE_PRESENTATION)
+        
+        val rootLayout = FrameLayout(context).apply { setBackgroundColor(Color.BLACK) }
 
-        // 2. The layout that forces the aspect ratio
         aspectRatioLayout = AspectRatioFrameLayout(context).apply {
             setBackgroundColor(Color.DKGRAY)
             val params = FrameLayout.LayoutParams(
@@ -158,7 +171,6 @@ class MirrorPresentation(
             layoutParams = params
         }
 
-        // 3. The surface where the phone screen is drawn
         val surfaceView = SurfaceView(context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -179,7 +191,6 @@ class MirrorPresentation(
         rootLayout.addView(aspectRatioLayout)
         setContentView(rootLayout)
 
-        // Listen for aspect ratio button clicks from the phone app dynamically
         scope.launch {
             aspectRatioState.collect { ratio ->
                 aspectRatioLayout.setRatio(ratio)
@@ -193,7 +204,6 @@ class MirrorPresentation(
     }
 }
 
-// Custom View that mathematically forces the exact Aspect Ratio
 class AspectRatioFrameLayout(context: Context) : FrameLayout(context) {
     private var targetRatio = 16f / 9f
 
