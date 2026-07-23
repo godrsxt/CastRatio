@@ -7,23 +7,28 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Display
-import android.view.ViewGroup
+import android.view.Gravity
+import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.flow.MutableStateFlow
 
-// Global state to share the chosen aspect ratio with the TV Screen
-val aspectRatioState = MutableStateFlow(16f / 9f)
+// Simple object to pass the ratio data from the Phone UI to the TV UI safely
+object RatioState {
+    var currentRatio: Float = 16f / 9f
+    var listener: ((Float) -> Unit)? = null
+
+    fun update(ratio: Float) {
+        currentRatio = ratio
+        listener?.invoke(ratio)
+    }
+}
 
 class MainActivity : ComponentActivity() {
     private var currentPresentation: CastPresentation? = null
@@ -34,7 +39,6 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 MainScreen(
                     onOpenCastSettings = {
-                        // Opens the phone's native cast menu to connect to Anycast
                         startActivity(Intent(Settings.ACTION_CAST_SETTINGS))
                     }
                 )
@@ -65,7 +69,8 @@ class MainActivity : ComponentActivity() {
             val display = displays[0]
             if (currentPresentation?.display?.displayId != display.displayId) {
                 currentPresentation?.dismiss()
-                currentPresentation = CastPresentation(this, display).apply { show() }
+                currentPresentation = CastPresentation(this, display)
+                currentPresentation?.show()
             }
         }
     }
@@ -79,12 +84,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainScreen(onOpenCastSettings: () -> Unit) {
-    var currentRatio by remember { mutableStateOf(16f / 9f) }
-
-    // When the user clicks a button, update the global state sent to the TV
-    LaunchedEffect(currentRatio) {
-        aspectRatioState.value = currentRatio
-    }
+    var currentRatio by remember { mutableStateOf(RatioState.currentRatio) }
 
     Column(
         modifier = Modifier
@@ -106,47 +106,99 @@ fun MainScreen(onOpenCastSettings: () -> Unit) {
         Spacer(modifier = Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { currentRatio = 16f / 9f }) { Text("16:9") }
-            Button(onClick = { currentRatio = 4f / 3f }) { Text("4:3") }
-            Button(onClick = { currentRatio = 21f / 9f }) { Text("21:9") }
+            Button(onClick = { 
+                currentRatio = 16f / 9f
+                RatioState.update(currentRatio)
+            }) { Text("16:9") }
+            
+            Button(onClick = { 
+                currentRatio = 4f / 3f
+                RatioState.update(currentRatio)
+            }) { Text("4:3") }
+            
+            Button(onClick = { 
+                currentRatio = 21f / 9f
+                RatioState.update(currentRatio)
+            }) { Text("21:9") }
         }
     }
 }
 
-// This class draws the UI directly onto the Anycast TV display
+// -------------------------------------------------------------------------
+// TV DISPLAY LOGIC (Using crash-proof standard Android Views instead of Compose)
+// -------------------------------------------------------------------------
 class CastPresentation(context: Context, display: Display) : Presentation(context, display) {
+    
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val composeView = ComposeView(context).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            setContent {
-                val ratio by aspectRatioState.collectAsState()
-                
-                // Black background to hide the unused TV space
-                Box(
-                    modifier = Modifier.fillMaxSize().background(Color.Black),
-                    contentAlignment = Alignment.Center
-                ) {
-                    // The actual content box resized to the aspect ratio
-                    Box(
-                        modifier = Modifier
-                            .aspectRatio(ratio)
-                            .fillMaxSize()
-                            .background(Color.DarkGray),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "TV Output\nAspect Ratio applied successfully.",
-                            color = Color.White,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                }
+        
+        // 1. Root Layout (Black borders)
+        val rootLayout = FrameLayout(context).apply {
+            setBackgroundColor(android.graphics.Color.BLACK)
+        }
+        
+        // 2. The Resizing Box (Dark Gray Background)
+        val aspectContainer = FrameLayout(context).apply {
+            setBackgroundColor(android.graphics.Color.DKGRAY)
+        }
+        
+        // 3. The Text inside the box
+        val textView = TextView(context).apply {
+            text = "TV Output\nAspect Ratio applied successfully."
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 24f
+            gravity = Gravity.CENTER
+        }
+        
+        aspectContainer.addView(textView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        ))
+        
+        rootLayout.addView(aspectContainer, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        ))
+        
+        setContentView(rootLayout)
+        
+        // 4. Listen for button clicks from the phone to resize the box
+        RatioState.listener = { targetRatio ->
+            val displayMetrics = android.util.DisplayMetrics()
+            display.getMetrics(displayMetrics)
+            
+            val screenWidth = displayMetrics.widthPixels
+            val screenHeight = displayMetrics.heightPixels
+            val screenRatio = screenWidth.toFloat() / screenHeight.toFloat()
+            
+            val params = aspectContainer.layoutParams as FrameLayout.LayoutParams
+            
+            // Calculate exact pixel dimensions for the chosen ratio
+            if (screenRatio > targetRatio) {
+                // TV is wider than the ratio (Add black bars on left/right)
+                params.height = screenHeight
+                params.width = (screenHeight * targetRatio).toInt()
+            } else {
+                // TV is narrower than the ratio (Add black bars on top/bottom)
+                params.width = screenWidth
+                params.height = (screenWidth / targetRatio).toInt()
+            }
+            
+            // Update the TV UI instantly
+            aspectContainer.post {
+                aspectContainer.layoutParams = params
             }
         }
-        setContentView(composeView)
+        
+        // Trigger setup immediately on load
+        RatioState.listener?.invoke(RatioState.currentRatio)
+    }
+    
+    override fun onStop() {
+        super.onStop()
+        // Prevent memory leaks when Anycast disconnects
+        RatioState.listener = null
     }
 }
