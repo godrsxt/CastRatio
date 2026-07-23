@@ -23,8 +23,6 @@ class ScreenCaptureService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var currentPresentation: MirrorPresentation? = null
     private var tvSurface: Surface? = null
-    private var surfaceWidth = 0
-    private var surfaceHeight = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,6 +41,10 @@ class ScreenCaptureService : Service() {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+                
+                // Keep projection alive for Android 14+ strict rules
+                mediaProjection?.registerCallback(object : MediaProjection.Callback() {}, null)
+                
                 setupSecondaryDisplayScanner()
             }
         } catch (e: Exception) {
@@ -97,17 +99,14 @@ class ScreenCaptureService : Service() {
                 
                 try {
                     val displayContext = applicationContext.createDisplayContext(display)
-                    // FIX: Using the public OVERLAY constant instead of the hidden PRESENTATION constant
                     val windowContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         displayContext.createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
                     } else {
                         displayContext
                     }
 
-                    currentPresentation = MirrorPresentation(windowContext, display) { surface, w, h ->
+                    currentPresentation = MirrorPresentation(windowContext, display) { surface ->
                         tvSurface = surface
-                        surfaceWidth = w
-                        surfaceHeight = h
                         startVirtualDisplay()
                     }.apply { show() }
 
@@ -121,14 +120,24 @@ class ScreenCaptureService : Service() {
 
     private fun startVirtualDisplay() {
         stopVirtualDisplay()
-        if (tvSurface != null && surfaceWidth > 0 && surfaceHeight > 0 && mediaProjection != null) {
-            val metrics = resources.displayMetrics
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "CastRatioDisplay",
-                surfaceWidth, surfaceHeight, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                tvSurface, null, null
-            )
+        if (tvSurface != null && mediaProjection != null) {
+            try {
+                // FIX: Always capture using the phone's exact screen dimensions. 
+                // This prevents the hardware encoder from silently failing due to weird TV box dimensions.
+                val metrics = applicationContext.resources.displayMetrics
+                val screenWidth = metrics.widthPixels
+                val screenHeight = metrics.heightPixels
+                val screenDensity = metrics.densityDpi
+
+                virtualDisplay = mediaProjection?.createVirtualDisplay(
+                    "CastRatioDisplay",
+                    screenWidth, screenHeight, screenDensity,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    tvSurface, null, null
+                )
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 
@@ -148,7 +157,7 @@ class ScreenCaptureService : Service() {
 class MirrorPresentation(
     context: Context,
     display: Display,
-    private val onSurfaceReady: (Surface?, Int, Int) -> Unit
+    private val onSurfaceReady: (Surface?) -> Unit
 ) : Presentation(context, display) {
 
     private val scope = CoroutineScope(Dispatchers.Main + Job())
@@ -157,10 +166,11 @@ class MirrorPresentation(
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
+        // Root layout fills the TV with black bars
         val rootLayout = FrameLayout(context).apply { setBackgroundColor(Color.BLACK) }
 
+        // The aspect ratio container (No background color here so it doesn't block the video)
         aspectRatioLayout = AspectRatioFrameLayout(context).apply {
-            setBackgroundColor(Color.DKGRAY)
             val params = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -168,18 +178,22 @@ class MirrorPresentation(
             layoutParams = params
         }
 
+        // The video feed surface
         val surfaceView = SurfaceView(context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
+            // FIX: Forces the video to render above the window background
+            setZOrderMediaOverlay(true)
+            
             holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(holder: SurfaceHolder) {}
-                override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
-                    onSurfaceReady(holder.surface, w, h)
+                override fun surfaceCreated(holder: SurfaceHolder) {
+                    onSurfaceReady(holder.surface)
                 }
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
-                    onSurfaceReady(null, 0, 0)
+                    onSurfaceReady(null)
                 }
             })
         }
