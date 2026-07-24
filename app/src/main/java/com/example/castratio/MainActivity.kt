@@ -1,25 +1,33 @@
 package com.example.castratio
 
+import android.app.Activity
 import android.app.Presentation
 import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Display
 import android.view.Gravity
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.widget.FrameLayout
-import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
-// Simple object to pass the ratio data from the Phone UI to the TV UI safely
+// Passes the chosen output ratio from the Phone UI to the TV UI.
 object RatioState {
     var currentRatio: Float = 16f / 9f
     var listener: ((Float) -> Unit)? = null
@@ -28,6 +36,12 @@ object RatioState {
         currentRatio = ratio
         listener?.invoke(ratio)
     }
+}
+
+// Lets the (out-of-process-timing) capture service reach the live Presentation
+// that MainActivity is currently showing on the external display.
+object PresentationBridge {
+    var current: CastPresentation? = null
 }
 
 class MainActivity : ComponentActivity() {
@@ -65,12 +79,14 @@ class MainActivity : ComponentActivity() {
         if (displays.isEmpty()) {
             currentPresentation?.dismiss()
             currentPresentation = null
+            PresentationBridge.current = null
         } else {
             val display = displays[0]
             if (currentPresentation?.display?.displayId != display.displayId) {
                 currentPresentation?.dismiss()
                 currentPresentation = CastPresentation(this, display)
                 currentPresentation?.show()
+                PresentationBridge.current = currentPresentation
             }
         }
     }
@@ -79,12 +95,43 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         currentPresentation?.dismiss()
         currentPresentation = null
+        PresentationBridge.current = null
     }
 }
 
 @Composable
 fun MainScreen(onOpenCastSettings: () -> Unit) {
     var currentRatio by remember { mutableStateOf(RatioState.currentRatio) }
+    val context = LocalContext.current
+    val projectionManager = remember {
+        context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+    }
+
+    val captureLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            if (PresentationBridge.current == null) {
+                Toast.makeText(
+                    context,
+                    "Connect to the Anycast dongle first (step 1), then start mirroring.",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                val serviceIntent = Intent(context, ScreenCaptureService::class.java).apply {
+                    putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, result.resultCode)
+                    putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, result.data)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(serviceIntent)
+                } else {
+                    context.startService(serviceIntent)
+                }
+            }
+        } else {
+            Toast.makeText(context, "Screen capture permission denied", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -93,112 +140,147 @@ fun MainScreen(onOpenCastSettings: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("Anycast Ratio Controller", style = MaterialTheme.typography.headlineSmall)
-        
-        Spacer(modifier = Modifier.height(48.dp))
+        Text("Anycast Mirror", style = MaterialTheme.typography.headlineSmall)
+
+        Spacer(modifier = Modifier.height(32.dp))
 
         Button(onClick = onOpenCastSettings, modifier = Modifier.fillMaxWidth().height(60.dp)) {
             Text("1. Connect to Anycast")
         }
 
-        Spacer(modifier = Modifier.height(48.dp))
-        Text("2. Set TV Aspect Ratio:", style = MaterialTheme.typography.bodyLarge)
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            onClick = { captureLauncher.launch(projectionManager.createScreenCaptureIntent()) },
+            modifier = Modifier.fillMaxWidth().height(60.dp)
+        ) {
+            Text("2. Start Mirroring")
+        }
+
+        Spacer(modifier = Modifier.height(32.dp))
+        Text("3. Set TV Aspect Ratio:", style = MaterialTheme.typography.bodyLarge)
         Spacer(modifier = Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { 
+            Button(onClick = {
                 currentRatio = 16f / 9f
                 RatioState.update(currentRatio)
             }) { Text("16:9") }
-            
-            Button(onClick = { 
+
+            Button(onClick = {
                 currentRatio = 4f / 3f
                 RatioState.update(currentRatio)
             }) { Text("4:3") }
-            
-            Button(onClick = { 
+
+            Button(onClick = {
                 currentRatio = 21f / 9f
                 RatioState.update(currentRatio)
             }) { Text("21:9") }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(onClick = {
+            context.stopService(Intent(context, ScreenCaptureService::class.java))
+        }, modifier = Modifier.fillMaxWidth()) {
+            Text("Stop Mirroring")
         }
     }
 }
 
 // -------------------------------------------------------------------------
-// TV DISPLAY LOGIC (Using crash-proof standard Android Views instead of Compose)
+// TV DISPLAY LOGIC (standard Android Views, same pattern as the working
+// CastRatio proof of concept -- just with a live SurfaceView in place of
+// the placeholder text box).
 // -------------------------------------------------------------------------
 class CastPresentation(context: Context, display: Display) : Presentation(context, display) {
-    
+
+    lateinit var aspectContainer: FrameLayout
+        private set
+    lateinit var surfaceView: SurfaceView
+        private set
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // 1. Root Layout (Black borders)
+
+        // 1. Root layout (black borders = the letterbox/pillarbox bars)
         val rootLayout = FrameLayout(context).apply {
             setBackgroundColor(android.graphics.Color.BLACK)
         }
-        
-        // 2. The Resizing Box (Dark Gray Background)
-        val aspectContainer = FrameLayout(context).apply {
+
+        // 2. The resizing box -- this is exactly the box from the proof of
+        // concept that you confirmed resizes correctly on your hardware.
+        aspectContainer = FrameLayout(context).apply {
             setBackgroundColor(android.graphics.Color.DKGRAY)
         }
-        
-        // 3. The Text inside the box
-        val textView = TextView(context).apply {
-            text = "TV Output\nAspect Ratio applied successfully."
-            setTextColor(android.graphics.Color.WHITE)
-            textSize = 24f
-            gravity = Gravity.CENTER
-        }
-        
-        aspectContainer.addView(textView, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER
-        ))
-        
-        rootLayout.addView(aspectContainer, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER
-        ))
-        
+
+        // 3. Live mirrored content goes here now, filling the box exactly.
+        // Because it's MATCH_PARENT inside aspectContainer, it automatically
+        // follows every resize the ratio buttons trigger -- no need to
+        // recreate the capture when the ratio changes.
+        surfaceView = SurfaceView(context)
+        aspectContainer.addView(
+            surfaceView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        rootLayout.addView(
+            aspectContainer,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            )
+        )
+
         setContentView(rootLayout)
-        
-        // 4. Listen for button clicks from the phone to resize the box
+
+        // 4. Same resize logic as the working proof of concept.
         RatioState.listener = { targetRatio ->
             val displayMetrics = android.util.DisplayMetrics()
             display.getMetrics(displayMetrics)
-            
+
             val screenWidth = displayMetrics.widthPixels
             val screenHeight = displayMetrics.heightPixels
             val screenRatio = screenWidth.toFloat() / screenHeight.toFloat()
-            
+
             val params = aspectContainer.layoutParams as FrameLayout.LayoutParams
-            
-            // Calculate exact pixel dimensions for the chosen ratio
+
             if (screenRatio > targetRatio) {
-                // TV is wider than the ratio (Add black bars on left/right)
                 params.height = screenHeight
                 params.width = (screenHeight * targetRatio).toInt()
             } else {
-                // TV is narrower than the ratio (Add black bars on top/bottom)
                 params.width = screenWidth
                 params.height = (screenWidth / targetRatio).toInt()
             }
-            
-            // Update the TV UI instantly
+
             aspectContainer.post {
                 aspectContainer.layoutParams = params
             }
         }
-        
-        // Trigger setup immediately on load
+
         RatioState.listener?.invoke(RatioState.currentRatio)
     }
-    
+
+    /** Registers a callback for when this Presentation's SurfaceView has a real Surface. */
+    fun onSurfaceAvailable(callback: (SurfaceHolder) -> Unit) {
+        val holder = surfaceView.holder
+        if (holder.surface != null && holder.surface.isValid) {
+            callback(holder)
+            return
+        }
+        holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) = callback(holder)
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) {}
+        })
+    }
+
     override fun onStop() {
         super.onStop()
-        // Prevent memory leaks when Anycast disconnects
         RatioState.listener = null
     }
 }
